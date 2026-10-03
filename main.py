@@ -2,53 +2,59 @@ import cv2
 import mediapipe as mp
 import pyautogui
 import ctypes
-import time
+import math
 
 
-# =========================
+# =========================================================
 # SETTINGS
-# =========================
+# =========================================================
 
 CAMERA_INDEX = 0
 
-# Prevent repeated slide changes
-SLIDE_COOLDOWN = 1.0
+# Mouse movement
+FRAME_MARGIN = 100
+SMOOTHING = 0.25
 
-# Windows Media Play/Pause virtual key
+# Pinch distance
+PINCH_THRESHOLD = 0.055
+
+# Windows global media key
 VK_MEDIA_PLAY_PAUSE = 0xB3
 KEYEVENTF_KEYUP = 0x0002
 
 
-# =========================
-# MEDIAPIPE
-# =========================
+# =========================================================
+# INITIAL SETUP
+# =========================================================
 
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
 
+screen_width, screen_height = pyautogui.size()
 
-last_slide_action = 0
+# Previous mouse position for smoothing
+smooth_x = screen_width / 2
+smooth_y = screen_height / 2
 
-# Used so one fist = one Play/Pause command
-previous_fist = False
+# Used to prevent repeated actions
+last_discrete_gesture = "NONE"
 
 
-# =========================
-# GLOBAL MEDIA PLAY / PAUSE
-# =========================
+# =========================================================
+# HELPERS
+# =========================================================
+
+def distance(p1, p2):
+    return math.sqrt(
+        (p1.x - p2.x) ** 2 +
+        (p1.y - p2.y) ** 2
+    )
+
 
 def media_play_pause():
     """
-    Sends the Windows global MEDIA_PLAY_PAUSE key.
-
-    Works with applications such as:
-    Spotify
-    YouTube
-    VLC
-    Media Player
-    Browser audio/video
-
-    even when they are in the background.
+    Global Windows Media Play/Pause.
+    Works even when browser/media player is in background.
     """
 
     user32 = ctypes.windll.user32
@@ -69,141 +75,283 @@ def media_play_pause():
         0
     )
 
-    print("MEDIA PLAY / PAUSE")
+    print("PLAY / PAUSE")
 
 
-# =========================
-# FINGER DETECTION
-# =========================
+# =========================================================
+# FINGER STATES
+# =========================================================
 
-def finger_states(hand_landmarks, handedness):
+def finger_states(hand_landmarks):
+    """
+    Returns states for:
+    index, middle, ring, pinky
+
+    True = open
+    False = closed
+
+    Thumb is handled separately because thumb direction
+    is used for slide control.
+    """
 
     lm = hand_landmarks.landmark
 
-    # Main fingers
     index = lm[8].y < lm[6].y
     middle = lm[12].y < lm[10].y
     ring = lm[16].y < lm[14].y
     pinky = lm[20].y < lm[18].y
 
-    # Thumb
-    if handedness == "Right":
-        thumb = lm[4].x < lm[3].x
-    else:
-        thumb = lm[4].x > lm[3].x
-
-    return [
-        thumb,
-        index,
-        middle,
-        ring,
-        pinky
-    ]
+    return index, middle, ring, pinky
 
 
-# =========================
+# =========================================================
 # GESTURE DETECTION
-# =========================
+# =========================================================
 
-def detect_gesture(states):
+def detect_gesture(hand_landmarks):
 
-    thumb, index, middle, ring, pinky = states
+    lm = hand_landmarks.landmark
 
-    # -------------------------
-    # ONE FINGER
-    # -------------------------
+    index, middle, ring, pinky = finger_states(
+        hand_landmarks
+    )
+
+    # Thumb-index distance
+    pinch_distance = distance(
+        lm[4],
+        lm[8]
+    )
+
+
+    # =====================================================
+    # OK SIGN
+    #
+    # Thumb + Index touching
+    # Middle, Ring, Pinky open
+    # =====================================================
+
+    if (
+        pinch_distance < PINCH_THRESHOLD
+        and middle
+        and ring
+        and pinky
+    ):
+        return "PLAY_PAUSE"
+
+
+    # =====================================================
+    # CLICK
+    #
+    # Thumb + Index touching
+    # Middle, Ring, Pinky closed
+    # =====================================================
+
+    if (
+        pinch_distance < PINCH_THRESHOLD
+        and not middle
+        and not ring
+        and not pinky
+    ):
+        return "CLICK"
+
+
+    # =====================================================
+    # THUMB UP / DOWN
+    #
+    # Other fingers must be closed
+    # =====================================================
+
+    other_fingers_closed = (
+        not index
+        and not middle
+        and not ring
+        and not pinky
+    )
+
+    if other_fingers_closed:
+
+        thumb_tip = lm[4]
+        thumb_mcp = lm[2]
+
+        vertical_difference = (
+            thumb_tip.y - thumb_mcp.y
+        )
+
+        horizontal_difference = abs(
+            thumb_tip.x - thumb_mcp.x
+        )
+
+        # Thumb must be mainly vertical
+        if abs(vertical_difference) > horizontal_difference:
+
+            # Smaller Y = higher in image
+            if vertical_difference < -0.08:
+                return "NEXT"
+
+            # Larger Y = lower in image
+            if vertical_difference > 0.08:
+                return "PREVIOUS"
+
+
+    # =====================================================
+    # MOUSE CONTROL
+    #
     # Index finger only
+    # =====================================================
+
     if (
         index
         and not middle
         and not ring
         and not pinky
     ):
-        return "NEXT"
-
-
-    # -------------------------
-    # TWO FINGERS
-    # -------------------------
-    # Index + middle
-    if (
-        index
-        and middle
-        and not ring
-        and not pinky
-    ):
-        return "PREVIOUS"
-
-
-    # -------------------------
-    # FIST
-    # -------------------------
-    # All 5 fingers closed
-    if not any(states):
-        return "FIST"
+        return "MOUSE"
 
 
     return "NONE"
 
 
-# =========================
-# SLIDE CONTROL
-# =========================
+# =========================================================
+# MOUSE MOVEMENT
+# =========================================================
 
-def slide_action(action):
+def move_mouse(
+    hand_landmarks,
+    frame_width,
+    frame_height
+):
 
-    global last_slide_action
+    global smooth_x
+    global smooth_y
 
-    now = time.time()
+    lm = hand_landmarks.landmark
 
-    if now - last_slide_action < SLIDE_COOLDOWN:
-        return False
+    # Index fingertip
+    index_tip = lm[8]
+
+    camera_x = int(
+        index_tip.x * frame_width
+    )
+
+    camera_y = int(
+        index_tip.y * frame_height
+    )
 
 
-    if action == "NEXT":
+    # =====================================================
+    # ACTIVE CAMERA AREA
+    # =====================================================
+
+    min_x = FRAME_MARGIN
+    max_x = frame_width - FRAME_MARGIN
+
+    min_y = FRAME_MARGIN
+    max_y = frame_height - FRAME_MARGIN
+
+
+    # Clamp
+    camera_x = max(
+        min_x,
+        min(camera_x, max_x)
+    )
+
+    camera_y = max(
+        min_y,
+        min(camera_y, max_y)
+    )
+
+
+    # =====================================================
+    # CAMERA -> SCREEN
+    # =====================================================
+
+    target_x = (
+        (camera_x - min_x)
+        / (max_x - min_x)
+        * screen_width
+    )
+
+    target_y = (
+        (camera_y - min_y)
+        / (max_y - min_y)
+        * screen_height
+    )
+
+
+    # =====================================================
+    # SMOOTHING
+    # =====================================================
+
+    smooth_x = (
+        smooth_x
+        + (target_x - smooth_x)
+        * SMOOTHING
+    )
+
+    smooth_y = (
+        smooth_y
+        + (target_y - smooth_y)
+        * SMOOTHING
+    )
+
+
+    pyautogui.moveTo(
+        int(smooth_x),
+        int(smooth_y),
+        duration=0
+    )
+
+
+# =========================================================
+# DISCRETE ACTIONS
+# =========================================================
+
+def execute_discrete_action(gesture):
+
+    if gesture == "CLICK":
+
+        pyautogui.click()
+
+        print("LEFT CLICK")
+
+
+    elif gesture == "NEXT":
 
         pyautogui.press("right")
 
         print("NEXT SLIDE")
 
-        last_slide_action = now
 
-        return True
-
-
-    elif action == "PREVIOUS":
+    elif gesture == "PREVIOUS":
 
         pyautogui.press("left")
 
         print("PREVIOUS SLIDE")
 
-        last_slide_action = now
 
-        return True
+    elif gesture == "PLAY_PAUSE":
 
-
-    return False
+        media_play_pause()
 
 
-# =========================
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 
 def main():
 
-    global previous_fist
+    global last_discrete_gesture
 
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = cv2.VideoCapture(
+        CAMERA_INDEX
+    )
 
 
     if not cap.isOpened():
 
-        print("ERROR: Could not open webcam.")
-
         print(
-            "Try changing CAMERA_INDEX "
-            "from 0 to 1."
+            "ERROR: Could not open camera."
         )
 
         return
@@ -224,12 +372,14 @@ def main():
 
         print("")
         print("==============================")
-        print(" Gesture Controller Started")
+        print(" Gesture Computer Controller")
         print("==============================")
         print("")
-        print("1 finger = NEXT")
-        print("2 fingers = PREVIOUS")
-        print("Fist      = MEDIA PLAY/PAUSE")
+        print("Index Finger = Move Mouse")
+        print("Pinch        = Left Click")
+        print("Thumb Up     = Next Slide")
+        print("Thumb Down   = Previous Slide")
+        print("OK Sign      = Play/Pause")
         print("")
         print("Q = Quit")
         print("")
@@ -240,16 +390,22 @@ def main():
 
             ok, frame = cap.read()
 
-
             if not ok:
                 break
 
 
-            # Mirror image
-            frame = cv2.flip(frame, 1)
+            # Mirror camera
+            frame = cv2.flip(
+                frame,
+                1
+            )
 
 
-            # OpenCV BGR -> RGB
+            frame_height, frame_width, _ = (
+                frame.shape
+            )
+
+
             rgb = cv2.cvtColor(
                 frame,
                 cv2.COLOR_BGR2RGB
@@ -262,9 +418,9 @@ def main():
             gesture = "NONE"
 
 
-            # =========================
+            # =================================================
             # HAND FOUND
-            # =========================
+            # =================================================
 
             if results.multi_hand_landmarks:
 
@@ -274,69 +430,67 @@ def main():
                 )
 
 
-                handedness = (
-
-                    results
-                    .multi_handedness[0]
-                    .classification[0]
-                    .label
-
+                gesture = detect_gesture(
+                    hand_landmarks
                 )
 
 
-                states = finger_states(
-                    hand_landmarks,
-                    handedness
-                )
+                # =============================================
+                # CONTINUOUS MOUSE
+                # =============================================
+
+                if gesture == "MOUSE":
+
+                    move_mouse(
+                        hand_landmarks,
+                        frame_width,
+                        frame_height
+                    )
+
+                    # Mouse movement allows future actions
+                    last_discrete_gesture = "NONE"
 
 
-                gesture = detect_gesture(states)
+                # =============================================
+                # DISCRETE ACTIONS
+                # =============================================
+
+                elif gesture in [
+
+                    "CLICK",
+                    "NEXT",
+                    "PREVIOUS",
+                    "PLAY_PAUSE"
+
+                ]:
+
+                    # Only execute once when gesture appears
+                    if (
+                        gesture
+                        != last_discrete_gesture
+                    ):
+
+                        execute_discrete_action(
+                            gesture
+                        )
+
+                        last_discrete_gesture = (
+                            gesture
+                        )
 
 
-                # =========================
-                # NEXT
-                # =========================
+                # =============================================
+                # NOTHING
+                # =============================================
 
-                if gesture == "NEXT":
+                else:
 
-                    slide_action("NEXT")
-
-
-                # =========================
-                # PREVIOUS
-                # =========================
-
-                elif gesture == "PREVIOUS":
-
-                    slide_action("PREVIOUS")
+                    last_discrete_gesture = "NONE"
 
 
-                # =========================
-                # GLOBAL MEDIA
-                # =========================
-
-                elif gesture == "FIST":
-
-                    # Trigger only once when
-                    # fist is first detected
-
-                    if not previous_fist:
-
-                        media_play_pause()
-
-
-                    previous_fist = True
-
-
-                # Hand isn't fist anymore
-                if gesture != "FIST":
-
-                    previous_fist = False
-
-
-                # =========================
+                # =============================================
                 # DRAW HAND
-                # =========================
+                # =============================================
 
                 mp_draw.draw_landmarks(
 
@@ -351,12 +505,40 @@ def main():
 
             else:
 
-                previous_fist = False
+                last_discrete_gesture = "NONE"
 
 
-            # =========================
-            # DISPLAY UI
-            # =========================
+            # =================================================
+            # ACTIVE MOUSE AREA
+            # =================================================
+
+            cv2.rectangle(
+
+                frame,
+
+                (
+                    FRAME_MARGIN,
+                    FRAME_MARGIN
+                ),
+
+                (
+                    frame_width
+                    - FRAME_MARGIN,
+
+                    frame_height
+                    - FRAME_MARGIN
+                ),
+
+                (255, 255, 255),
+
+                1
+
+            )
+
+
+            # =================================================
+            # UI
+            # =================================================
 
             cv2.rectangle(
 
@@ -364,7 +546,7 @@ def main():
 
                 (10, 10),
 
-                (520, 120),
+                (620, 135),
 
                 (0, 0, 0),
 
@@ -379,11 +561,11 @@ def main():
 
                 f"Gesture: {gesture}",
 
-                (20, 45),
+                (20, 42),
 
                 cv2.FONT_HERSHEY_SIMPLEX,
 
-                0.8,
+                0.75,
 
                 (0, 255, 0),
 
@@ -396,9 +578,9 @@ def main():
 
                 frame,
 
-                "1 Finger: NEXT | 2 Fingers: PREVIOUS",
+                "Index: Mouse | Pinch: Click",
 
-                (20, 75),
+                (20, 70),
 
                 cv2.FONT_HERSHEY_SIMPLEX,
 
@@ -415,9 +597,28 @@ def main():
 
                 frame,
 
-                "Fist: Global Media Play/Pause | Q: Quit",
+                "Thumb Up: Next | Thumb Down: Previous",
 
-                (20, 100),
+                (20, 95),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.55,
+
+                (255, 255, 255),
+
+                1
+
+            )
+
+
+            cv2.putText(
+
+                frame,
+
+                "OK Sign: Global Play/Pause",
+
+                (20, 120),
 
                 cv2.FONT_HERSHEY_SIMPLEX,
 
@@ -432,7 +633,7 @@ def main():
 
             cv2.imshow(
 
-                "Gesture Controller",
+                "Gesture Computer Controller",
 
                 frame
 
@@ -452,9 +653,9 @@ def main():
     cv2.destroyAllWindows()
 
 
-# =========================
+# =========================================================
 # RUN
-# =========================
+# =========================================================
 
 if __name__ == "__main__":
     main()
